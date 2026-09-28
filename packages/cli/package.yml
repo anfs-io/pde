@@ -1,0 +1,5 @@
+version: 0.1.0
+author: rjayroach
+# The command-line toolset every shell gets: pde/bash and pde/zsh depend on this package, so the
+# tools and their config are the same whichever shell is installed
+brew: [bat, fzf, htop, tree]

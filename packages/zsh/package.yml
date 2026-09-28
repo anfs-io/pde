@@ -1,6 +1,7 @@
-version: 0.1.2
+version: 0.1.3
 author: rjayroach
-brew: [bat, fzf, htop, tree]
+# The command-line tools (bat, fzf, ...) and their config come from pde/cli, shared with pde/bash
+depends: [cli]
 # zsh itself comes from the distro so the login shell is a path listed in /etc/shells
 system:
   linux: [zsh]

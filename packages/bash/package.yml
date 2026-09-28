@@ -1,5 +1,7 @@
-version: 0.1.1
+version: 0.1.2
 author: rjayroach
+# The command-line tools (bat, fzf, ...) and their config come from pde/cli, shared with pde/zsh
+depends: [cli]
 # No brew/system entries on purpose: bash ships with every supported Linux, and on macOS
 # install.sh brews bash 5 as an untracked bootstrap formula (macOS ships 3.2). Declaring it
 # here would let `ppm remove bash` uninstall the bash ppm's own scripts run on.
