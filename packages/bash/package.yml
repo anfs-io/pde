@@ -1,7 +1,12 @@
-version: 0.1.2
+version: 0.1.1
 author: rjayroach
 # The command-line tools (bat, fzf, ...) and their config come from pde/cli, shared with pde/zsh
 depends: [cli]
-# No brew/system entries on purpose: bash ships with every supported Linux, and on macOS
+# No entries for bash itself, on purpose: bash ships with every supported Linux, and on macOS
 # install.sh brews bash 5 as an untracked bootstrap formula (macOS ships 3.2). Declaring it
 # here would let `ppm remove bash` uninstall the bash ppm's own scripts run on.
+# bash-completion is .bashrc's: brew's @2 needs bash 4.2+, which is what macOS gets from install.sh
+system:
+  linux: [bash-completion]
+brew:
+  macos: [bash-completion@2]

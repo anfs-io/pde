@@ -63,6 +63,30 @@ fi
 
 ensure_path "$BIN_DIR"
 
+# bash-completion, before the snippet loop: generated completion scripts (cobra-style, e.g.
+# varlock's) call its _get_comp_words_by_ref, so a snippet that registers one checks for it.
+# The distro's own ~/.bashrc used to load it, and pde/bash moves that file aside. Both
+# profile.d scripts return early when already loaded (BASH_COMPLETION_VERSINFO), which keeps a
+# reload cheap, and when bash is older than 4.2 — /bin/bash 3.2 on macOS simply goes without.
+# brew's copy also loads $HOMEBREW_PREFIX/etc/bash_completion.d, where formulas put theirs.
+for _bc in "${HOMEBREW_PREFIX:-/nonexistent}/etc/profile.d/bash_completion.sh" \
+           /etc/profile.d/bash_completion.sh; do
+  [ -r "$_bc" ] && { . "$_bc"; break; }
+done
+unset _bc
+
+# The distro's bash-completion only knows /etc/bash_completion.d, so on Linux load the
+# completions Homebrew formulas install. Once per shell: a reload must not re-source them.
+if [ -z "${_PPM_BREW_COMPLETIONS:-}" ] && [ -n "${HOMEBREW_PREFIX:-}" ] &&
+   [ -n "${BASH_COMPLETION_VERSINFO:-}" ] &&
+   [ ! -r "$HOMEBREW_PREFIX/etc/profile.d/bash_completion.sh" ]; then
+  _PPM_BREW_COMPLETIONS=1
+  for _bc in "$HOMEBREW_PREFIX"/etc/bash_completion.d/*; do
+    [ -r "$_bc" ] && . "$_bc"
+  done
+  unset _bc
+fi
+
 # Two levels of nesting are globbed explicitly rather than with `shopt -s globstar`: macOS
 # ships bash 3.2, which has no globstar. Two levels is what packages actually use
 # (~/.config/zsh/op/, ssh/, ruby/).
