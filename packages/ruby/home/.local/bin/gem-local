@@ -19,8 +19,8 @@ Commands:
   src rm <path>           Remove a repo path from the config
   path [gem]              Output path to the gems dir, or a gem's repo dir
   cd [gem]                Change to the gems dir, or a gem's repo dir
-                          (requires the gem-local function in ruby/tools.zsh)
-  completion <shell>      Output shell completion code (zsh)
+                          (requires the gem-local function in ~/.config/sh/ruby.sh)
+  completion <shell>      Output shell completion code (zsh, bash)
   help                    Show this help
 
 Config: $RUBY_LOCAL_GEMS_CONFIG (~/.config/ruby/local-gems), one repo path per
@@ -35,7 +35,7 @@ line; blank lines and # comments are ignored, a leading ~ is expanded
   - writes a Gemfile of path gems, runs bundle install and puts binstubs for
     gems with an exe/ dir in $RUBY_LOCAL_GEMS_HOME/bin
 
-ruby/tools.zsh adds $RUBY_LOCAL_GEMS_HOME/bin to $PATH and each gem's lib dir to
+~/.config/sh/ruby.sh adds $RUBY_LOCAL_GEMS_HOME/bin to $PATH and each gem's lib dir to
 $RUBYLIB when the shell starts, so open a new shell after a build.
 EOF
 }
@@ -303,7 +303,7 @@ _local-gems() {
       fi
       ;;
     path|cd)     (( CURRENT == 3 )) && _local_gems_names ;;
-    completion)  (( CURRENT == 3 )) && compadd zsh ;;
+    completion)  (( CURRENT == 3 )) && compadd zsh bash ;;
   esac
 }
 
@@ -314,8 +314,71 @@ else
 fi
 COMPLETION
       ;;
+    bash)
+      cat <<'COMPLETION'
+# bash completion for gem-local. Self-contained: needs neither bash-completion nor bash 4.
+# Candidates are filtered with case rather than compgen -W, which would tilde-expand the
+# ~/ paths in the config and then never match what was typed.
+
+_gem_local_add() {
+  local cur="$1" word
+  shift
+  for word in "$@"; do
+    case "$word" in "$cur"*) COMPREPLY+=("$word") ;; esac
+  done
+}
+
+_gem_local() {
+  local cur="${COMP_WORDS[COMP_CWORD]}" link entry
+  local dir="${RUBY_LOCAL_GEMS_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/gems}"
+  local cfg="${RUBY_LOCAL_GEMS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/ruby/local-gems}"
+  COMPREPLY=()
+
+  if [[ $COMP_CWORD -eq 1 ]]; then
+    _gem_local_add "$cur" build list src path cd completion help
+    return 0
+  fi
+
+  case "${COMP_WORDS[1]}" in
+    src)
+      if [[ $COMP_CWORD -eq 2 ]]; then
+        _gem_local_add "$cur" list add rm
+      elif [[ $COMP_CWORD -eq 3 ]]; then
+        case "${COMP_WORDS[2]}" in
+          add)
+            type compopt >/dev/null 2>&1 && compopt -o filenames
+            local IFS=$'\n'
+            COMPREPLY=($(compgen -d -- "$cur"))
+            ;;
+          rm)
+            [[ -r "$cfg" ]] || return 0
+            while IFS= read -r entry || [[ -n "$entry" ]]; do
+              [[ "$entry" =~ ^[[:space:]]*# ]] && continue
+              [[ -z "${entry// }" ]] && continue
+              _gem_local_add "$cur" "$entry"
+            done < "$cfg"
+            ;;
+        esac
+      fi
+      ;;
+    path|cd)
+      [[ $COMP_CWORD -eq 2 ]] || return 0
+      for link in "$dir"/*; do
+        [[ -L "$link" ]] && _gem_local_add "$cur" "${link##*/}"
+      done
+      ;;
+    completion)
+      [[ $COMP_CWORD -eq 2 ]] && _gem_local_add "$cur" zsh bash
+      ;;
+  esac
+  return 0
+}
+
+complete -F _gem_local gem-local
+COMPLETION
+      ;;
     *)
-      echo "Usage: gem-local completion <zsh>" >&2
+      echo "Usage: gem-local completion <zsh|bash>" >&2
       return 1
       ;;
   esac
@@ -326,7 +389,7 @@ case "${1:-}" in
   list|ls)     shift; cmd_list ;;
   src)         shift; cmd_src "$@" ;;
   path)        shift; cmd_path "$@" ;;
-  cd)          echo "gem-local cd requires the gem-local shell function (source ruby.zsh)" >&2; exit 1 ;;
+  cd)          echo "gem-local cd requires the gem-local shell function (source ~/.config/sh/ruby.sh)" >&2; exit 1 ;;
   completion)  shift; cmd_completion "$@" ;;
   help|--help) usage ;;
   "")          usage ;;
