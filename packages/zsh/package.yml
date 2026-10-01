@@ -1,4 +1,4 @@
-version: 0.1.3
+version: 0.1.4
 author: rjayroach
 # The command-line tools (bat, fzf, ...) and their config come from pde/cli, shared with pde/bash
 depends: [cli]

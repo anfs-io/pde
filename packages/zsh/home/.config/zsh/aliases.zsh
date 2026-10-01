@@ -7,6 +7,8 @@
 
 export PPM_FPATH=$XDG_DATA_HOME/omz/custom/completions
 
+xt() { export TERM=xterm-256color; }
+
 # Write a completion file for <cmd> to $PPM_FPATH if <cmd> is installed and the file is missing
 # Packages call this from their own .zsh file; `zsrc -c <cmd>` forces a refresh
 # Usage: zcomp <cmd> [generator args...]   (default args: completion zsh)
