@@ -1,156 +1,78 @@
-# OpCreds - 1Password Credential Management CLI
+# op — 1Password credentials
 
-A Ruby CLI tool for managing infrastructure credentials in 1Password, built with dry-cli.
+Installs the 1Password CLI and desktop app, points ssh at the 1Password SSH
+agent, and forwards a service account token to remote hosts.
 
-## Overview
 
-OpCreds provides a structured way to create, retrieve, rotate, and manage credentials for various infrastructure services (AWS, Proxmox, Kubernetes, etc.) stored in 1Password. It uses a provider-based architecture that makes it easy to add support for new service types.
+## Division of responsibility
 
-## Dependencies
+- **fnox owns secrets.** A `fnox.toml` declares what a directory needs and
+  resolves it through the `op` CLI. This package ships no per-tool wrappers.
+- **This package owns the one thing fnox cannot bootstrap remotely**: getting a
+  service account token onto a host so the `op` there can authenticate at all.
 
-- Ruby (managed via mise)
-- dry-cli gem
-- 1Password CLI (`op`) - installed via mise
-
-## Directory Structure
-
-```
-home/
-├── .config/
-│   ├── mise/conf.d/op.toml    # mise tool config for op CLI
-│   └── zsh/op.zsh             # shell aliases and helper functions
-└── .local/
-    ├── bin/
-    │   └── opcreds            # CLI entrypoint
-    └── share/opcreds/
-        ├── cli.rb             # dry-cli command definitions
-        ├── config.rb          # Configuration management (~/.config/opcreds/config.yml)
-        ├── credential.rb      # Credential model
-        ├── op_client.rb       # Wrapper around `op` CLI (single entry point)
-        ├── providers/         # Provider implementations
-        │   ├── base.rb        # Base class with shared logic
-        │   ├── generic.rb     # Generic provider for any service
-        │   ├── aws.rb         # AWS IAM users, access keys
-        │   └── proxmox.rb     # Proxmox VE credentials
-        └── templates/         # ERB templates for policies, configs
-            └── iam_credential_manager_policy.json.erb
-```
-
-## Usage
-
-```bash
-# Create credentials
-opcreds create -p proxmox -s singapore -u root --url https://pve.sg.lab:8006
-opcreds create -p aws -s singapore -S terraform -v AWS-Operations
-opcreds create -p generic -s us --service traefik -u admin
-
-# Retrieve credentials
-opcreds get "Proxmox - Singapore"
-opcreds get "AWS Singapore - terraform" -f "Access Key ID"
-opcreds get "Proxmox - US" --format env
-
-# List credentials
-opcreds list -v HomeLab
-opcreds list -p aws -s singapore
-
-# Rotate credentials
-opcreds rotate "Proxmox - Singapore"
-
-# Configuration
-opcreds config --list
-opcreds config default_vault HomeLab
-```
-
-## Architecture
-
-### OpClient
-
-Single entry point for all 1Password CLI operations. Located in `op_client.rb`.
-
-- Uses Singleton pattern for consistent state
-- Returns `Result` structs with `success?`, `data`, `error`
-- Supports debug mode via `OPCREDS_DEBUG=1`
-- Handles field type inference (concealed, text, url, otp)
-
-### Providers
-
-Each provider inherits from `Providers::Base` and implements:
-
-- `build_credential(options)` - Create a Credential instance from CLI options
-- `rotate(existing_item)` - Rotate credentials for an existing item
-
-Providers handle service-specific logic like:
-- Field naming conventions
-- Default vaults
-- Rotation procedures
-- API integration (where applicable)
-
-### Configuration
-
-Stored in `~/.config/opcreds/config.yml`. Supports:
-
-- Default vaults per credential type
-- Site definitions with aliases and AWS regions
-- Dot notation for nested keys (`opcreds config sites.singapore.aws_region`)
-
-## Shell Integration
-
-The `op.zsh` file provides:
-
-- `opc` - alias for opcreds
-- `opget`, `opnew`, `opls` - quick access functions
-- `openv` - load a single secret into an environment variable
-- `opsource` - inject secrets from a template file into environment
-
-## Adding New Providers
-
-1. Create `providers/<name>.rb`
-2. Inherit from `Providers::Base`
-3. Implement `build_credential` and `rotate`
-4. Add to the factory in `providers/base.rb`
-
-```ruby
-# providers/example.rb
-module OpCreds
-  module Providers
-    class Example < Base
-      def build_credential(options)
-        Credential.new(
-          title: build_title("Example", options[:site]),
-          vault: options[:vault] || config.vault_for(:default),
-          tags: build_tags("example", options[:site]),
-          # ... fields specific to this provider
-        )
-      end
-
-      def rotate(existing_item)
-        # Provider-specific rotation logic
-      end
-    end
-  end
-end
-```
-
-## Vault Organization
-
-Recommended vault structure:
+## Layout
 
 ```
-AWS-Bootstrap/          # Root accounts, bootstrap credentials (rarely accessed)
-AWS-Operations/         # Day-to-day AWS service credentials
-HomeLab/               # Infrastructure credentials (Proxmox, K8s, etc.)
+home/.config/zsh/op.zsh          zcomp op — completions, nothing else
+home/.config/zsh/ssh/op.zsh      ssh hook: forwards the token
+home/.local/bin/op-provision     vault / service account lifecycle (bash)
+macos/.ssh/config.d/99-op.conf   IdentityAgent -> 1Password agent socket
+linux/.config/mise/conf.d/op.toml
+install.sh                       sshd AcceptEnv drop-in
 ```
 
-## Environment Variables
+`home/.config/zsh/ssh/` is a hook directory owned by pde/ssh. Files there load
+after `ssh.zsh` because `.` (0x2E) sorts before `/` (0x2F) in `.zshrc`'s
+`$ZSH_CONFIG/**/*.zsh(N)` glob, so `ssh_register` always exists in time.
 
-- `OPCREDS_DEBUG=1` - Enable debug output showing op commands
+## Invariants — do not break these
+
+1. **Exactly one secret crosses ssh:** `OP_SERVICE_ACCOUNT_TOKEN`. Everything
+   else is declared at both ends and re-resolved remotely. Do not add a
+   mechanism to forward more; that is ADR-001's rejected Option 4.
+2. **`env = false` on the token.** `op` reads `OP_SERVICE_ACCOUNT_TOKEN` from the
+   environment, so an exported token would override desktop auth for every local
+   `op` call and would be readable by anything started in that directory. The
+   hook materialises it with `fnox get` for the ssh process alone.
+3. **The token is declared per directory, never globally.** The hook forwards
+   whatever the current directory resolves; a global declaration forwards it
+   everywhere, including to third-party hosts.
+4. **`provider = "onepass"` on every secret.** A bare `{ value = "op://..." }`
+   is a stored literal — fnox returns it verbatim and never calls the provider,
+   even with `default_provider` set.
+5. **The token never enters argv.** Not in the ssh command line (SendEnv carries
+   it), not in `op item create` (piped as JSON on stdin). argv is world-readable
+   via `ps`.
+6. **`op-provision` runs `op` via `env -u OP_SERVICE_ACCOUNT_TOKEN`**, so it
+   authenticates as the human even inside a provisioned directory.
+7. **Every token item is tagged `$OP_PROVISION_TAG` and carries scope metadata
+   fields.** It is the only queryable index of what has been provisioned, because
+   vaults and service accounts cannot be tagged. Do not stop writing the tag or
+   the fields; `list` depends on them.
+
+## Useful facts about the tools
+
+- `op service-account` has only `create` and `ratelimit`. No delete, no token
+  reissue. Rotation means a new account; revocation goes through
+  `op user delete` or the web UI.
+- 1Password refuses to grant a service account access to Personal or Private.
+- `op service-account create` repeats `--vault`, and supports `--expires-in`
+  (available, deliberately not adopted — see ADR-001's revision).
+- sshd silently discards environment variables not named in `AcceptEnv`. A
+  missing `AcceptEnv` looks exactly like "no secrets configured".
+- Only *items* support tags and `--tags` filtering. `op vault create` offers just
+  `--description`/`--icon`, and `op vault list` filters only by
+  `--group`/`--user`/`--permission`.
+- `op item list --format json | op item get -` is 1Password's documented way to
+  fetch many items in one call; use it rather than a loop.
 
 ## Testing
 
 ```bash
-# Dry run to see what would be created
-opcreds create -p proxmox -s singapore --dry-run
-
-# Check op CLI is working
-op whoami
+bats packages/op/tests/ssh-hook.bats
+bats packages/op/tests/op-provision.bats
 ```
+
+Offline, stubbed, under a second. Keep them that way — no test should require a
+1Password account or the network.

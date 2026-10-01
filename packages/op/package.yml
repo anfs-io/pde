@@ -1,8 +1,14 @@
-version: 0.1.0
+version: 0.1.1
 author: rjayroach
 # macOS: the CLI ships as a cask next to the desktop app, for app integration and biometric unlock.
 # Linux: the CLI comes from mise (linux/.config/mise) — hosts there use service account tokens,
 # which never touch the desktop app. Desktop-app integration on Linux would need op in
 # /usr/local/bin, group onepassword-cli, setgid, which only 1Password's apt/dnf packages set up.
+depends:
+  # ssh provides the ssh() dispatcher this package registers its token-forwarding hook with,
+  # and the `Include config.d/*.conf` line that 99-op.conf needs.
+  - ssh
+  # fnox resolves the service account token; the hook is inert without it.
+  - fnox
 cask:
   macos: [1password, 1password-cli]

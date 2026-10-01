@@ -111,3 +111,91 @@ This eliminates alias/function conflicts between 1Password desktop plugins and o
 - Evaluate HCP Vault or similar solutions for production environments with stricter security requirements
 - Consider short-lived SA tokens if 1Password adds support for token expiration
 - SSH config `SetEnv`/`AcceptEnv` for per-host vault mapping when multiple environments are in regular use
+
+---
+
+## Revision 2026-09: fnox replaces the hand-rolled implementation
+
+**Status:** The decision above — Option 5, service accounts — stands. The
+implementation it describes is superseded.
+
+### What prompted this
+
+The implementation had stopped working, and it is worth recording why, because
+the failure was invisible. `_op_env()` and `zssh` derived the vault name from
+`$OP_SPACE` or `$CHORUS_SPACE`. Nothing in the shipped system ever set either:
+the `.mise.toml` files that `op.zsh` claimed would set them did not exist in any
+space, and `CHORUS_SPACE` appeared only in the chorus gem's planning documents.
+Both functions therefore failed on every invocation while continuing to load in
+every shell. The documented `SA - <env>` vault convention had also drifted from
+the `<space>-<area>` naming the code actually built.
+
+The lesson worth keeping: **credential plumbing that derives its configuration
+from ambient environment variables fails silently when nothing sets them.** The
+replacement derives nothing; configuration is a file whose presence is the
+signal.
+
+### What changed
+
+- **fnox owns credential loading.** `_op_env()`, the lazy `gh`/`aws` wrappers,
+  and `_op_space`/`_op_area`/`_op_vault` are deleted. fnox's `1password`
+  provider shells out to the same `op` CLI, so the trust model is unchanged;
+  only the plumbing moved. Adding a credential is now a line of TOML rather than
+  a new shell function.
+- **Configuration is layered by directory.** `~/.config/fnox/config.toml` for
+  cross-cutting secrets, a `fnox.toml` in any project or space directory for
+  that scope; both load and the directory file wins. This replaces the derived
+  `<space>-<area>` vault name with an explicit declaration whose location *is*
+  the scope.
+- **Keychain caching dropped.** The fnox daemon's cache replaces `_op_sa_token`.
+  This retires the consequence listed above: "Keychain cache must be manually
+  cleared when SA tokens are rotated." The token secret sets
+  `daemon_cache = false`, so a rotation takes effect immediately.
+- **`zssh` is gone; plain `ssh` carries the token.** pde/ssh now provides a
+  single `ssh` wrapper that packages register hooks with; pde/op registers one
+  that forwards the token, and pde/ghostty registers the per-host theming that
+  used to require typing `sshg`. A wrapper command only helps when you remember
+  to type it, which is a poor property for a security control.
+- **Transport is `SendEnv`, not an interpolated remote command.** This closes a
+  real hole. The previous implementation built
+  `ssh -t host "export OP_SERVICE_ACCOUNT_TOKEN='$tok'; exec \$SHELL -l"`, so a
+  token containing a single quote was arbitrary remote code execution. The token
+  now never enters a string that a shell will parse, and never enters argv,
+  where `ps` would expose it. Dropping the remote command also made
+  `ssh host <command>` work, which the wrapper had silently discarded.
+- **`SendEnv` is passed per invocation, not configured.** Putting
+  `SendEnv OP_SERVICE_ACCOUNT_TOKEN` under `Host *` would transmit the token to
+  every host, including github.com on every push. The hook adds `-o` only when
+  the current directory resolves a token.
+- **The token is `env = false`.** It is never in any shell environment. This
+  matters more than it did when this ADR was written: editors, language servers
+  and coding agents are routinely started from project directories and inherit
+  whatever is exported there.
+- **Vault layout: shared plus per-scope.** Each service account is granted
+  `--vault <scope>:read_items --vault <shared>:read_items`, so one token covers
+  a scope's secrets and the cross-cutting ones. The `SA - <env>` naming
+  convention in the Decision section is retired; scopes are named for what they
+  serve. Note 1Password refuses to grant a service account access to Personal or
+  Private, so scope vaults must be regular shared vaults.
+- **Provisioning is a guided script**, `op-provision`, rather than shell
+  functions: create, status, rotate, destroy, link.
+
+### Deferred: short-lived tokens
+
+"Future considerations" above anticipated token expiry, and 1Password has since
+shipped it — `op service-account create --expires-in 24h`. Not adopted yet. With
+`env = false` the token is materialised on demand rather than held in a session,
+so the exposure window is already small, and expiry would mean re-running
+provisioning on a schedule. Revisit when rotation can run unattended.
+
+Worth noting for whoever picks that up: 1Password cannot reissue a token for an
+existing service account, and `op` has no `service-account delete`. Rotation is
+therefore create-new-then-revoke-old, and revocation goes through `op user
+delete` or the web console.
+
+### Also delivered from "Future considerations"
+
+`SSH config SetEnv/AcceptEnv for per-host vault mapping` — `AcceptEnv` is now in
+use on the server side. Scoping turned out to belong to the *directory* (via
+fnox config layering) rather than the host, which is a better fit: the same host
+is often used from several scopes.

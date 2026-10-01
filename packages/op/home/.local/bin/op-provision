@@ -1,0 +1,520 @@
+#!/usr/bin/env bash
+# op-provision — create and manage 1Password vaults and service accounts.
+#
+# Provisioning is occasional, security-sensitive, and easy to get subtly wrong,
+# so this script encodes the conventions rather than leaving them to memory:
+#
+#   vault  <name>            a regular shared vault holding that scope's secrets
+#   vault  $OP_SHARED_VAULT  cross-cutting secrets every scope also needs
+#   SA     <name>-sa         read-only on both of the above
+#   item   <name>-sa-token   the SA's token, saved in $OP_SA_CREDENTIALS_VAULT
+#
+# 1Password refuses to grant a service account access to Personal or Private, so
+# the readable vaults must be regular shared vaults. The token item may live in
+# Private, because it is read by you with desktop auth, never by the SA.
+#
+# Input modes:
+#   --wizard   walk through every decision, explaining the tradeoffs
+#   --prompt   ask only for what was not passed
+#   (neither)  strict: every required value must be a flag, or it fails
+# All three show a plan and confirm before touching 1Password; --yes skips the
+# confirmation and --dry-run prints the plan and exits.
+
+set -euo pipefail
+
+: "${OP_SA_CREDENTIALS_VAULT:=Private}"
+: "${OP_SHARED_VAULT:=shared}"
+# Every token item this script writes carries this tag, which is what makes
+# `op-provision list` a single server-side query. Vaults and service accounts
+# cannot be tagged — `op vault create` takes only --description and --icon, and
+# service accounts are account members — so the token item is the index of what
+# has been provisioned, and it records the vault and account names as fields.
+: "${OP_PROVISION_TAG:=op-provision}"
+
+PROG=${0##*/}
+
+MODE=strict          # strict | prompt | wizard
+ASSUME_YES=0
+DRY_RUN=0
+FORCE=0
+JSON_OUT=0
+NAME=""
+SHARED="$OP_SHARED_VAULT"
+TOKEN_VAULT="$OP_SA_CREDENTIALS_VAULT"
+declare -a HOSTS=()
+
+die()  { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+say()  { printf '%s\n' "$*"; }
+
+# Always authenticate as the human, never as a forwarded service account. Inside
+# a provisioned directory OP_SERVICE_ACCOUNT_TOKEN may be set, and a read-only
+# single-vault SA cannot create anything.
+op_() { env -u OP_SERVICE_ACCOUNT_TOKEN op "$@"; }
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "$1 is required but not installed"
+}
+
+usage() {
+  cat <<EOF
+$PROG — create and manage 1Password vaults and service accounts
+
+Usage:
+  $PROG create  <name> [--shared V] [--token-vault V]   vault + service account + token
+  $PROG list                                            every scope $PROG has provisioned
+  $PROG status  <name>                                  what exists today
+  $PROG rotate  <name>                                  new token, then revoke the old SA
+  $PROG destroy <name>                                  remove token item, SA and vault
+  $PROG link    <name> [--host H]...                    write ./fnox.toml for this directory
+
+Input modes:
+  --wizard, --guided   walk through each decision with explanation
+  --prompt             ask only for values not supplied as flags
+  (neither)            strict — missing values are an error
+
+Options:
+  --shared VAULT       cross-cutting vault every SA also reads   (default: $OP_SHARED_VAULT)
+  --token-vault VAULT  vault the SA token item is saved in       (default: $OP_SA_CREDENTIALS_VAULT)
+  --host HOST          host to record in fnox.toml (link; repeatable)
+  -y, --yes            do not ask for confirmation
+  -n, --dry-run        show the plan and exit without changing anything
+      --force          overwrite an existing fnox.toml (link)
+      --json           machine-readable output (list)
+  -h, --help           this text
+
+Environment:
+  OP_SA_CREDENTIALS_VAULT   default for --token-vault
+  OP_SHARED_VAULT           default for --shared
+  OP_PROVISION_TAG          tag marking items this script created (default: op-provision)
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Interaction
+# ---------------------------------------------------------------------------
+
+interactive() { [[ $MODE == prompt || $MODE == wizard ]]; }
+
+require_tty() {
+  [[ -t 0 ]] || die "--$MODE needs a terminal; pass the values as flags instead"
+}
+
+ask() {           # ask <prompt> <default> -> echoes answer
+  local prompt=$1 default=${2:-} reply
+  require_tty
+  if [[ -n $default ]]; then
+    read -r -p "$prompt [$default]: " reply </dev/tty
+    printf '%s' "${reply:-$default}"
+  else
+    read -r -p "$prompt: " reply </dev/tty
+    printf '%s' "$reply"
+  fi
+}
+
+teach() {         # wizard-only explanation
+  [[ $MODE == wizard ]] || return 0
+  printf '\n%s\n' "$*"
+}
+
+confirm() {       # confirm <question>
+  if (( ASSUME_YES )); then return 0; fi
+  [[ -t 0 ]] || die "refusing to proceed unattended; pass --yes to confirm"
+  local reply
+  read -r -p "$1 [y/N] " reply </dev/tty
+  [[ $reply == [yY]* ]]
+}
+
+# Require a value: supplied by flag, asked for, or a hard error naming the flag.
+need_value() {    # need_value <current> <flag> <prompt> <default> <wizard-text>
+  local current=$1 flag=$2 prompt=$3 default=${4:-} lesson=${5:-}
+  if [[ -n $current ]]; then printf '%s' "$current"; return 0; fi
+  if interactive; then
+    [[ -n $lesson ]] && teach "$lesson"
+    ask "$prompt" "$default"
+    return 0
+  fi
+  die "missing $flag (try '$PROG $VERB --wizard' to be walked through it)"
+}
+
+# ---------------------------------------------------------------------------
+# 1Password queries
+# ---------------------------------------------------------------------------
+
+vault_exists()  { op_ vault get "$1"          --format json >/dev/null 2>&1; }
+item_exists()   { op_ item get "$1" --vault "$2" --format json >/dev/null 2>&1; }
+
+# Service accounts appear in the account's user list. There is no
+# `op service-account get`, so this is the only way to see them.
+#
+# A rotation cannot reuse the old account's name while it still exists, so
+# rotated accounts are "<name>-sa-<timestamp>". Everything that looks one up has
+# to match that too, or `destroy` would leave a live credential behind after a
+# rotation. The pattern is anchored and the suffix is exactly 14 digits so that
+# scope "lgat" cannot match an account belonging to scope "lgat-sandbox".
+sa_pattern() { printf '^%s-sa(-[0-9]{14})?$' "$1"; }
+
+sa_names() {   # every service account belonging to scope $1, newest name last
+  op_ user list --format json 2>/dev/null \
+    | jq -r --arg re "$(sa_pattern "$1")" '.[] | select(.name | test($re)) | .name' 2>/dev/null \
+    | sort
+}
+
+sa_exists() { [[ -n "$(sa_names "$1")" ]]; }
+
+# ---------------------------------------------------------------------------
+# Plan / execute
+# ---------------------------------------------------------------------------
+
+declare -a PLAN=()
+plan_add() { PLAN+=("$1"); }
+
+show_plan() {
+  if (( ${#PLAN[@]} == 0 )); then say "Nothing to do."; return 1; fi
+  say ""
+  say "Plan:"
+  local line; for line in "${PLAN[@]}"; do say "  $line"; done
+  say ""
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Verbs
+# ---------------------------------------------------------------------------
+
+cmd_create() {
+  need jq
+  NAME=$(need_value "$NAME" "<name>" "Vault / scope name (e.g. lgat)" "" \
+"A scope is one vault plus one service account that can read it. Name it after
+the thing it serves — a space, a project, a client. It must be a regular shared
+vault: 1Password will not grant a service account access to Personal or Private.")
+  [[ -n $NAME ]] || die "a name is required"
+
+  SHARED=$(need_value "$SHARED" --shared "Shared vault for cross-cutting secrets" "$OP_SHARED_VAULT" \
+"Secrets you need everywhere — a GitHub token, say — live in one shared vault
+instead of being copied into every scope. Each service account is granted read
+on its own vault and on this one, so a single forwarded token covers both.")
+
+  TOKEN_VAULT=$(need_value "$TOKEN_VAULT" --token-vault "Vault to save the SA token in" "$OP_SA_CREDENTIALS_VAULT" \
+"The token is itself a credential and is stored as an item. It may live in
+Private, because you read it with desktop authentication; the service account
+never reads its own token.")
+
+  local sa="${NAME}-sa" item="${NAME}-sa-token"
+
+  vault_exists "$NAME"        || plan_add "CREATE vault           $NAME"
+  vault_exists "$SHARED"      || plan_add "CREATE vault           $SHARED"
+  sa_exists    "$NAME"        || plan_add "CREATE service account $sa (read_items: $NAME, $SHARED)"
+  item_exists  "$item" "$TOKEN_VAULT" || plan_add "CREATE item            $item in $TOKEN_VAULT"
+
+  show_plan || return 0
+  if (( DRY_RUN )); then say "--dry-run: nothing was changed."; return 0; fi
+  confirm "Proceed?" || { say "Aborted."; return 1; }
+
+  vault_exists "$NAME"   || { op_ vault create "$NAME"   --description "$OP_PROVISION_TAG: scope $NAME"      --format json >/dev/null; say "Created vault $NAME"; }
+  vault_exists "$SHARED" || { op_ vault create "$SHARED" --description "$OP_PROVISION_TAG: cross-cutting secrets" --format json >/dev/null; say "Created vault $SHARED"; }
+
+  if ! sa_exists "$NAME"; then
+    create_sa_and_store_token "$sa" "$item"
+  else
+    say "Service account $(sa_names "$NAME" | tr '\n' ' ')already exists; leaving it alone."
+    say "To issue a fresh token for it, use: $PROG rotate $NAME"
+  fi
+
+  say ""
+  say "Add to the fnox.toml of any directory that should reach this scope:"
+  print_fnox_snippet
+  say ""
+  say "Or let $PROG write it for you:   cd <dir> && $PROG link $NAME"
+}
+
+# 1Password returns a service account token exactly once. If storing it fails the
+# token is gone and the SA is orphaned, so the store is attempted immediately and
+# the failure is made loud.
+create_sa_and_store_token() {
+  local sa=$1 item=$2 sa_json
+
+  if ! sa_json=$(op_ service-account create "$sa" \
+        --vault "${NAME}:read_items" \
+        --vault "${SHARED}:read_items" \
+        --format json); then
+    die "failed to create service account $sa"
+  fi
+
+  if [[ $(printf '%s' "$sa_json" | jq -r 'has("token")') != true ]]; then
+    die "1Password returned no token for $sa"
+  fi
+
+  # The token goes to `op item create` on stdin, never in argv: anything in argv
+  # is readable from `ps` by any process on this machine. 1Password's own
+  # `op item create --help` warns about this. Note the token is threaded through
+  # .token in the piped JSON rather than passed via `jq --arg`, which would put
+  # it back in argv.
+  if ! printf '%s' "$sa_json" \
+      | jq --arg title "$item" --arg tag "$OP_PROVISION_TAG" --arg scope "$NAME" \
+           --arg shared "$SHARED" --arg sa "$sa" \
+           --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
+            title:    $title,
+            category: "API_CREDENTIAL",
+            tags:     [$tag, $scope],
+            fields: [
+              { id: "credential",      type: "CONCEALED", label: "credential",      value: .token },
+              { id: "scope",           type: "STRING",    label: "scope",           value: $scope },
+              { id: "shared_vault",    type: "STRING",    label: "shared vault",    value: $shared },
+              { id: "service_account", type: "STRING",    label: "service account", value: $sa },
+              { id: "provisioned",     type: "STRING",    label: "provisioned",     value: $created }
+            ]
+          }' \
+      | op_ item create - --vault "$TOKEN_VAULT" >/dev/null
+  then
+    warn "created $sa but could NOT save its token."
+    warn "1Password returns a service account token only once, so this one is lost."
+    warn "Revoke the orphaned account and start over:"
+    warn "  op user delete '$sa'      (or revoke it at https://my.1password.com)"
+    exit 1
+  fi
+
+  say "Created service account $sa (read_items: $NAME, $SHARED)"
+  say "Token saved as $item in $TOKEN_VAULT"
+}
+
+cmd_status() {
+  need jq
+  NAME=$(need_value "$NAME" "<name>" "Vault / scope name" "")
+  [[ -n $NAME ]] || die "a name is required"
+  local sa="${NAME}-sa" item="${NAME}-sa-token"
+
+  printf '%-22s %s\n' "vault $NAME"   "$(vault_exists "$NAME"   && echo present || echo MISSING)"
+  printf '%-22s %s\n' "vault $SHARED" "$(vault_exists "$SHARED" && echo present || echo MISSING)"
+  local found; found=$(sa_names "$NAME" | tr '\n' ' ')
+  printf '%-22s %s\n' "sa $sa"        "${found:-MISSING}"
+  printf '%-22s %s\n' "item $item"    "$(item_exists  "$item" "$TOKEN_VAULT" && echo "present in $TOKEN_VAULT" || echo MISSING)"
+}
+
+# Order matters: the replacement token is stored before the old account is
+# revoked, so a failure midway leaves you with working credentials rather than
+# none. 1Password cannot reissue a token for an existing service account, so a
+# rotation is necessarily a new account.
+cmd_rotate() {
+  need jq
+  NAME=$(need_value "$NAME" "<name>" "Vault / scope name to rotate" "" \
+"Rotation replaces the service account entirely: 1Password cannot issue a second
+token for an existing one. A new account is created and its token saved over the
+old item, and only then is the old account revoked.")
+  [[ -n $NAME ]] || die "a name is required"
+
+  local old item="${NAME}-sa-token"
+  local new="${NAME}-sa-$(date +%Y%m%d%H%M%S)"
+
+  # Rotate whatever account the scope currently has, which after an earlier
+  # rotation is not literally "<name>-sa".
+  old=$(sa_names "$NAME" | tail -1)
+  [[ -n $old ]] || die "no service account for $NAME; use '$PROG create $NAME'"
+
+  plan_add "CREATE service account $new (read_items: $NAME, $SHARED)"
+  plan_add "UPDATE item            $item in $TOKEN_VAULT -> new token"
+  plan_add "REVOKE service account $old"
+  show_plan || return 0
+  if (( DRY_RUN )); then say "--dry-run: nothing was changed."; return 0; fi
+  confirm "Rotate $NAME?" || { say "Aborted."; return 1; }
+
+  op_ item delete "$item" --vault "$TOKEN_VAULT" >/dev/null 2>&1 || true
+  create_sa_and_store_token "$new" "$item"
+
+  say ""
+  if confirm "New token stored. Revoke the old account $old now?"; then
+    revoke_sa "$old"
+  else
+    say "Left $old active. Revoke it when you are satisfied:"
+    say "  op user delete '$old'"
+  fi
+
+  say ""
+  say "Any fnox.toml pointing at op://$TOKEN_VAULT/$item/credential now resolves"
+  say "the new token; no config changes are needed."
+}
+
+# There is no `op service-account delete`. Service accounts are account members,
+# so `op user delete` is the CLI route; if this account does not allow it, say so
+# plainly rather than pretending the credential was revoked.
+revoke_sa() {
+  local sa=$1
+  if op_ user delete "$sa" >/dev/null 2>&1; then
+    say "Revoked $sa"
+  else
+    warn "could not revoke $sa from the CLI."
+    warn "Revoke it at https://my.1password.com -> Developer -> Service Accounts."
+    warn "Until you do, its token still grants read access."
+  fi
+}
+
+cmd_destroy() {
+  need jq
+  NAME=$(need_value "$NAME" "<name>" "Vault / scope name to destroy" "")
+  [[ -n $NAME ]] || die "a name is required"
+  local sa="${NAME}-sa" item="${NAME}-sa-token"
+
+  local -a sas; while IFS= read -r l; do [[ -n $l ]] && sas+=("$l"); done < <(sa_names "$NAME")
+  if item_exists "$item" "$TOKEN_VAULT"; then plan_add "DELETE item            $item from $TOKEN_VAULT"; fi
+  local one; for one in "${sas[@]:-}"; do [[ -n $one ]] && plan_add "REVOKE service account $one"; done
+  if vault_exists "$NAME";               then plan_add "DELETE vault           $NAME AND ALL ITS CONTENTS"; fi
+  show_plan || return 0
+  if (( DRY_RUN )); then say "--dry-run: nothing was changed."; return 0; fi
+
+  say "This is not reversible."
+  confirm "Destroy $NAME?" || { say "Aborted."; return 1; }
+
+  if item_exists "$item" "$TOKEN_VAULT"; then op_ item delete "$item" --vault "$TOKEN_VAULT" >/dev/null; say "Deleted item $item"; fi
+  for one in "${sas[@]:-}"; do [[ -n $one ]] && revoke_sa "$one"; done
+  if vault_exists "$NAME";               then op_ vault delete "$NAME" >/dev/null; say "Deleted vault $NAME"; fi
+  say "Note: $SHARED was left alone; other scopes read it."
+}
+
+# Everything this script has provisioned, found by the tag on each token item.
+#
+# Two calls total regardless of how many scopes exist: `op item get -` takes the
+# list on stdin, which is 1Password's documented idiom for exactly this and
+# avoids a per-item round trip. Vaults are not queried at all — they cannot be
+# tagged, and the token item already records which vault each scope uses.
+cmd_list() {
+  need jq
+  local items count
+  if ! items=$(op_ item list --tags "$OP_PROVISION_TAG" --format json 2>/dev/null); then
+    die "could not list items — is op signed in? (op whoami)"
+  fi
+  count=$(printf '%s' "$items" | jq 'length' 2>/dev/null || echo 0)
+  if [[ ${count:-0} -eq 0 ]]; then
+    say "Nothing tagged '$OP_PROVISION_TAG' yet."
+    say "Provision a scope with: $PROG create <name> --wizard"
+    return 0
+  fi
+
+  local full
+  full=$(printf '%s' "$items" | op_ item get --format json - 2>/dev/null) \
+    || die "could not read item details"
+
+  if (( JSON_OUT )); then
+    printf '%s' "$full" | jq -s 'flatten(1)'
+    return 0
+  fi
+
+  # -s + flatten(1) because `op item get -` may emit either a JSON array or a
+  # stream of objects depending on version; both normalise to one array here.
+  {
+    printf 'SCOPE\tSHARED\tSERVICE ACCOUNT\tTOKEN ITEM\tTOKEN VAULT\tPROVISIONED\n'
+    printf '%s' "$full" | jq -s -r '
+      def fld($id): ([.fields[]? | select(.id == $id) | .value] | first) // "";
+      flatten(1) | .[] |
+      (fld("scope")) as $scope |
+      [ (if $scope == "" then (.title | sub("-sa-token$"; "")) else $scope end),
+        (fld("shared_vault") | if . == "" then "-" else . end),
+        (fld("service_account") | if . == "" then "-" else . end),
+        .title,
+        (.vault.name // "-"),
+        (fld("provisioned") | if . == "" then "-" else (.[0:10]) end)
+      ] | @tsv'
+  } | column -t -s "$(printf '\t')"
+
+  say ""
+  say "A scope's own vault is named after the scope. TOKEN VAULT is where that"
+  say "scope's token item is kept. Vaults are not queried here — 1Password cannot"
+  say "tag a vault, so the token item is the record of what was provisioned."
+  say "Use '$PROG status <scope>' to check one scope, or 'op vault list' for all vaults."
+}
+
+print_fnox_snippet() {
+  cat <<EOF
+  [providers.onepass]
+  type  = "1password"
+  vault = "$NAME"
+
+  [secrets]
+  OP_SERVICE_ACCOUNT_TOKEN = { provider = "onepass", value = "op://$TOKEN_VAULT/${NAME}-sa-token/credential", env = false }
+EOF
+}
+
+# Writes the directory's fnox.toml. The token is declared here rather than in the
+# global config on purpose: the ssh hook forwards whatever the current directory
+# resolves, so a global declaration would forward your token from everywhere,
+# including to third-party hosts like github.com.
+cmd_link() {
+  NAME=$(need_value "$NAME" "<name>" "Vault / scope this directory belongs to" "" \
+"Linking writes a fnox.toml here. From this directory and anything below it,
+fnox resolves that scope's secrets and plain ssh forwards its service account
+token to remote hosts.")
+  [[ -n $NAME ]] || die "a name is required"
+
+  local target="./fnox.toml"
+  if [[ -e $target ]] && (( ! FORCE )); then
+    die "$target already exists (pass --force to overwrite)"
+  fi
+
+  plan_add "WRITE  $PWD/fnox.toml (scope: $NAME)"
+  if (( ${#HOSTS[@]} )); then plan_add "RECORD hosts: ${HOSTS[*]}"; fi
+  show_plan || return 0
+  if (( DRY_RUN )); then say "--dry-run: nothing was written."; say ""; print_fnox_snippet; return 0; fi
+  confirm "Write $target?" || { say "Aborted."; return 1; }
+
+  {
+    printf '# fnox — secrets for this directory tree.\n'
+    printf '# Written by %s on %s.\n#\n' "$PROG" "$(date +%Y-%m-%d)"
+    printf '# env = false on the token keeps it out of the environment, so nothing\n'
+    printf '# started here (editor, language server, agent) can read it. The ssh hook\n'
+    printf '# in pde/op materialises it for the ssh process alone.\n'
+    if (( ${#HOSTS[@]} )); then printf '#\n# Hosts this scope is used with: %s\n' "${HOSTS[*]}"; fi
+    printf '\ndefault_provider = "onepass"\n\n'
+    printf '[providers.onepass]\ntype  = "1password"\nvault = "%s"\n\n' "$NAME"
+    printf '[secrets]\n'
+    printf '# provider is named explicitly: a bare `value` is stored verbatim and\n'
+    printf '# never reaches the provider, so the op:// reference would not resolve.\n'
+    printf 'OP_SERVICE_ACCOUNT_TOKEN = { provider = "onepass", value = "op://%s/%s-sa-token/credential", env = false }\n' \
+      "$TOKEN_VAULT" "$NAME"
+    printf '\n# Secrets for this scope. env = "exec" keeps them out of the ambient\n'
+    printf '# environment; `fnox exec -- <cmd>` provides them.\n'
+    printf '# DATABASE_URL = { provider = "onepass", value = "postgres/url", env = "exec" }\n'
+  } > "$target"
+
+  say "Wrote $target"
+  say ""
+  say "Verify:  fnox config-files && fnox get OP_SERVICE_ACCOUNT_TOKEN >/dev/null && echo ok"
+  say "Then:    ssh <host>        # the token is forwarded from this directory"
+}
+
+# ---------------------------------------------------------------------------
+
+VERB=${1:-}
+[[ -n $VERB ]] || { usage; exit 1; }
+case $VERB in -h|--help|help) usage; exit 0 ;; esac
+shift
+
+# A bare name may follow the verb.
+if [[ ${1:-} != -* && -n ${1:-} ]]; then NAME=$1; shift; fi
+
+while (( $# )); do
+  case $1 in
+    --shared)       SHARED=${2:?--shared needs a value}; shift 2 ;;
+    --token-vault)  TOKEN_VAULT=${2:?--token-vault needs a value}; shift 2 ;;
+    --host)         HOSTS+=("${2:?--host needs a value}"); shift 2 ;;
+    --wizard|--guided) MODE=wizard; shift ;;
+    --prompt)       MODE=prompt; shift ;;
+    -y|--yes)       ASSUME_YES=1; shift ;;
+    -n|--dry-run)   DRY_RUN=1; shift ;;
+    --force)        FORCE=1; shift ;;
+    --json)         JSON_OUT=1; shift ;;
+    -h|--help)      usage; exit 0 ;;
+    *)              die "unknown option: $1" ;;
+  esac
+done
+
+need op
+if interactive; then require_tty; fi
+
+case $VERB in
+  create)  cmd_create ;;
+  list)    cmd_list ;;
+  status)  cmd_status ;;
+  rotate)  cmd_rotate ;;
+  destroy) cmd_destroy ;;
+  link)    cmd_link ;;
+  *)       die "unknown command: $VERB (try '$PROG --help')" ;;
+esac

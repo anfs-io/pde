@@ -33,6 +33,12 @@ Installs the latest neovim and adds many common plugins along with a sensible co
 
 Installs the latest claude code via mise. claude code depends on Node
 
+### Cli
+
+The command-line toolset every shell gets (bat, fzf, htop, tree) with its config: `PAGER=bat`,
+fzf key bindings for bash and zsh, `tsa`/`bata`, `ip_addr` and a vi-mode `.inputrc`. `bash` and
+`zsh` both depend on it, so the tools are the same whichever shell is installed.
+
 ### Git
 
 Installs a systemwide .gitignore and a few zsh aliases
@@ -51,10 +57,22 @@ Installs the latest neovim and adds many common plugins along with a sensible co
 
 ### Op
 
-Installs the 1password CLI tool for integration with ssh keeping private keys off the system
+Installs the 1Password CLI and desktop app, points ssh at the 1Password SSH agent so private
+keys stay off the filesystem, and forwards a service account token to remote hosts so the `op`
+there can authenticate. Secrets themselves are declared in fnox; `op-provision` creates and
+rotates the vaults and service accounts. See `packages/op/README.md`.
+
+```bash
+op-provision create lgat          # vault + service account + token
+cd ~/spaces/lgat && op-provision link lgat
+ssh vm1                           # credentials follow you to the remote
+```
 
 ### SSH
 
+- Provides the ssh hook registry: `ssh` is wrapped once here and packages register hooks with it
+  by dropping a file in `~/.config/zsh/ssh/`, rather than each defining a competing wrapper or a
+  separate command you have to remember to type. See `packages/ssh/README.md`.
 - Installs sshfs on linux and macfuse+sshfs-mac on mac to enable mounting directories on remote hosts via ssh
 -  to pull a keys file to `$HOME/.ssh/authorizied_keys`:
 ```bash
