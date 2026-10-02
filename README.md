@@ -21,7 +21,7 @@ ppm install zsh git nvim tmux
 ### Shortcut to install all packages
 
 ```bash
-ppm install pde-ppm/all
+ppm install pde/
 ```
 
 
