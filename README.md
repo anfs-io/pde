@@ -3,12 +3,12 @@
 
 ## Usage
 
-Use ppm to add this package repository, clone the repo and install packages
+An [anfs](https://github.com/anfs-io/system) source (`packages/`), in anfs's default
+`system.list`. wsm, which used to live here, is part of anfs now.
 
 ```bash
-ppm add https://github.com/maxcole/pde-ppm
-ppm update
-ppm list pde-ppm
+anfs src add https://github.com/anfs-io/pde pde   # only if it is not already listed
+ppm list pde
 ppm install [PACKAGE]
 ```
 
@@ -45,11 +45,8 @@ Installs a systemwide .gitignore and a few zsh aliases
 
 ### Mise
 
-Mise is a package manager for most langauges and many common develper applications. ppm relies on mise to install these common tools
-
-### Node
-
-Installs the latest nodejs via mise
+mise is part of anfs's base install (install.sh brews it); packages declare the tools they want
+in `home/.config/mise/conf.d/<tool>.toml`. Node is `anfs/node`.
 
 ### Nvim
 
