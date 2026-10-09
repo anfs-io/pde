@@ -9,6 +9,8 @@
 
 zcomp op
 
+# check if you are running locally on macOS and set up 1Password as your local SSH agent
+# while skipping that configuration if you are logged in over SSH.
 if [[ "$(os)" == "macos" && -z "$SSH_CLIENT" ]]; then
-  export SSH_AUTH_SOCK=~/Library/Group\ Containers/2BUA8C4S2C.com.1password/t/agent.sock
+  export SSH_AUTH_SOCK="$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
 fi
